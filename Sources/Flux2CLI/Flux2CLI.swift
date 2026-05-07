@@ -103,8 +103,8 @@ struct TextToImage: AsyncParsableCommand {
     @Option(name: .long, help: "LoRA config JSON file (alternative to --lora, includes scheduler overrides)")
     var loraConfigPath: String?
 
-    @Option(name: .long, help: "VAE variant: standard (default), small-decoder (distilled, ~1.4x faster)")
-    var vaeVariant: String = "standard"
+    @Option(name: .long, help: "VAE variant: small-decoder (default, distilled, ~1.4x faster), standard")
+    var vaeVariant: String = "small-decoder"
 
     @Option(name: .long, help: "Memory profile: auto (default), conservative, balanced, performance")
     var memoryProfile: String = "auto"
@@ -426,8 +426,8 @@ struct ImageToImage: AsyncParsableCommand {
     @Option(name: .long, help: "LoRA config JSON file (alternative to --lora, includes scheduler overrides)")
     var loraConfigPath: String?
 
-    @Option(name: .long, help: "VAE variant: standard (default), small-decoder (distilled, ~1.4x faster)")
-    var vaeVariant: String = "standard"
+    @Option(name: .long, help: "VAE variant: small-decoder (default, distilled, ~1.4x faster), standard")
+    var vaeVariant: String = "small-decoder"
 
     @Option(name: .long, help: "Memory profile: auto (default), conservative, balanced, performance")
     var memoryProfile: String = "auto"
@@ -704,8 +704,8 @@ struct Download: AsyncParsableCommand {
     @Flag(name: .long, help: "Only download VAE")
     var vaeOnly: Bool = false
 
-    @Option(name: .long, help: "VAE variant to download: standard (default), small-decoder")
-    var vaeVariant: String = "standard"
+    @Option(name: .long, help: "VAE variant to download: small-decoder (default), standard")
+    var vaeVariant: String = "small-decoder"
 
     @Option(name: .long, help: "Custom models directory (for sandboxed apps or custom storage)")
     var modelsDir: String?

@@ -131,7 +131,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         model: Flux2Model = .dev,
         quantization: Flux2QuantizationConfig = .balanced,
         memoryOptimization: MemoryOptimizationConfig? = nil,
-        vaeVariant: ModelRegistry.VAEVariant = .standard,
+        vaeVariant: ModelRegistry.VAEVariant = .smallDecoder,
         hfToken: String? = nil
     ) {
         self.model = model
