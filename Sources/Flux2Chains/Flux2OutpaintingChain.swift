@@ -168,14 +168,16 @@ public struct Flux2OutpaintingChain: Flux2Chain {
 
     // MARK: - Canvas / mask builders
 
-    private static func roundUpToMultipleOf32(_ x: Int) -> Int {
+    /// Exposed as `internal` (instead of `private`) so the unit tests in the
+    /// same module can exercise the geometry without spinning up a pipeline.
+    internal static func roundUpToMultipleOf32(_ x: Int) -> Int {
         x == 0 ? 0 : ((x + 31) / 32) * 32
     }
 
     /// Build an RGB canvas of `canvasWidth × canvasHeight`, paint mid-grey
     /// Gaussian noise everywhere, then composite the source image at
     /// `(offsetX, offsetY)`.
-    private static func buildOutpaintCanvas(
+    internal static func buildOutpaintCanvas(
         sourceImage: CGImage,
         canvasWidth: Int,
         canvasHeight: Int,
@@ -241,7 +243,7 @@ public struct Flux2OutpaintingChain: Flux2Chain {
     ///   ramp adjacent to each side that actually has a strip.
     /// - Sides with zero padding get no transition band (no need — the keep
     ///   region simply runs to the canvas edge there).
-    private static func buildSmartMask(
+    internal static func buildSmartMask(
         canvasWidth: Int,
         canvasHeight: Int,
         keepX: Int,
