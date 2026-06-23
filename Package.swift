@@ -12,6 +12,7 @@ let package = Package(
         // CLI Tools
         .executable(name: "FluxEncodersCLI", targets: ["FluxEncodersCLI"]),
         .executable(name: "Flux2CLI", targets: ["Flux2CLI"]),
+        .executable(name: "Flux2Server", targets: ["Flux2Server"]),
         // Main Application
         .executable(name: "Flux2App", targets: ["Flux2App"]),
     ],
@@ -74,6 +75,13 @@ let package = Package(
                 "Flux2Chains",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Yams", package: "Yams"),
+            ]
+        ),
+        .executableTarget(
+            name: "Flux2Server",
+            dependencies: [
+                "Flux2Core",
+                "Flux2Chains",
             ]
         ),
         // MARK: - Main Application

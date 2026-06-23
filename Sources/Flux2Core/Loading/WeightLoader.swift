@@ -96,7 +96,7 @@ public class Flux2WeightLoader {
             // double_blocks.{i}.img_attn.qkv.weight -> split into toQ, toK, toV
             // double_blocks.{i}.txt_attn.qkv.weight -> split into addQProj, addKProj, addVProj
 
-            if key.contains(".img_attn.qkv.weight") {
+            if key.hasSuffix(".img_attn.qkv.weight") {
                 Flux2Debug.verbose("Splitting img_attn QKV: \(key) shape=\(value.shape)")
                 // Extract block index
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
@@ -108,7 +108,7 @@ public class Flux2WeightLoader {
                 mapped["transformerBlocks.\(blockIdx).attn.toQ.weight"] = q
                 mapped["transformerBlocks.\(blockIdx).attn.toK.weight"] = k
                 mapped["transformerBlocks.\(blockIdx).attn.toV.weight"] = v
-            } else if key.contains(".txt_attn.qkv.weight") {
+            } else if key.hasSuffix(".txt_attn.qkv.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 let dim = value.shape[0] / 3
                 let q = value[0..<dim, 0...]
@@ -117,48 +117,48 @@ public class Flux2WeightLoader {
                 mapped["transformerBlocks.\(blockIdx).attn.addQProj.weight"] = q
                 mapped["transformerBlocks.\(blockIdx).attn.addKProj.weight"] = k
                 mapped["transformerBlocks.\(blockIdx).attn.addVProj.weight"] = v
-            } else if key.contains(".img_attn.proj.weight") {
+            } else if key.hasSuffix(".img_attn.proj.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.toOut.weight"] = value
-            } else if key.contains(".txt_attn.proj.weight") {
+            } else if key.hasSuffix(".txt_attn.proj.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.toAddOut.weight"] = value
-            } else if key.contains(".img_attn.norm.query_norm.scale") {
+            } else if key.hasSuffix(".img_attn.norm.query_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.normQ.weight"] = value
-            } else if key.contains(".img_attn.norm.key_norm.scale") {
+            } else if key.hasSuffix(".img_attn.norm.key_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.normK.weight"] = value
-            } else if key.contains(".txt_attn.norm.query_norm.scale") {
+            } else if key.hasSuffix(".txt_attn.norm.query_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.normAddedQ.weight"] = value
-            } else if key.contains(".txt_attn.norm.key_norm.scale") {
+            } else if key.hasSuffix(".txt_attn.norm.key_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).attn.normAddedK.weight"] = value
-            } else if key.contains(".img_mlp.0.weight") {
+            } else if key.hasSuffix(".img_mlp.0.weight") {
                 // BFL: img_mlp.0 is the gated linear (produces 2x for SwiGLU)
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).ff.activation.proj.weight"] = value
-            } else if key.contains(".img_mlp.2.weight") {
+            } else if key.hasSuffix(".img_mlp.2.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).ff.linearOut.weight"] = value
-            } else if key.contains(".txt_mlp.0.weight") {
+            } else if key.hasSuffix(".txt_mlp.0.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).ffContext.activation.proj.weight"] = value
-            } else if key.contains(".txt_mlp.2.weight") {
+            } else if key.hasSuffix(".txt_mlp.2.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "double_blocks.")
                 mapped["transformerBlocks.\(blockIdx).ffContext.linearOut.weight"] = value
-            } else if key.hasPrefix("single_blocks.") && key.contains(".linear1.weight") {
+            } else if key.hasPrefix("single_blocks.") && key.hasSuffix(".linear1.weight") {
                 // Single blocks have fused QKV+MLP
                 let blockIdx = extractBlockIndex(from: key, prefix: "single_blocks.")
                 mapped["singleTransformerBlocks.\(blockIdx).attn.toQkvMlp.weight"] = value
-            } else if key.hasPrefix("single_blocks.") && key.contains(".linear2.weight") {
+            } else if key.hasPrefix("single_blocks.") && key.hasSuffix(".linear2.weight") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "single_blocks.")
                 mapped["singleTransformerBlocks.\(blockIdx).attn.toOut.weight"] = value
-            } else if key.hasPrefix("single_blocks.") && key.contains(".norm.query_norm.scale") {
+            } else if key.hasPrefix("single_blocks.") && key.hasSuffix(".norm.query_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "single_blocks.")
                 mapped["singleTransformerBlocks.\(blockIdx).attn.normQ.weight"] = value
-            } else if key.hasPrefix("single_blocks.") && key.contains(".norm.key_norm.scale") {
+            } else if key.hasPrefix("single_blocks.") && key.hasSuffix(".norm.key_norm.scale") {
                 let blockIdx = extractBlockIndex(from: key, prefix: "single_blocks.")
                 mapped["singleTransformerBlocks.\(blockIdx).attn.normK.weight"] = value
             } else if key == "img_in.weight" {
@@ -558,6 +558,30 @@ public class Flux2WeightLoader {
         to model: Flux2Transformer2DModel
     ) throws {
         let mapped = mapTransformerWeights(&weights)
+
+        // MLX-native MXFP8 checkpoints store packed uint32 weights plus sibling
+        // `<layer>.scales` tensors. Replace the matching Linear modules with
+        // QuantizedLinear before applying parameters so calls dispatch to
+        // quantizedMM(mode: .mxfp8) instead of regular fp16 matmul.
+        var quantizedModules: [String: Module] = [:]
+        for (key, scale) in mapped where key.hasSuffix(".scales") {
+            let layerPath = String(key.dropLast(".scales".count))
+            let weightKey = layerPath + ".weight"
+            guard let packedWeight = mapped[weightKey], packedWeight.dtype == .uint32 else { continue }
+            quantizedModules[layerPath] = QuantizedLinear(
+                weight: packedWeight,
+                bias: nil,
+                scales: scale,
+                biases: nil,
+                groupSize: 32,
+                bits: 8,
+                mode: .mxfp8
+            )
+        }
+        if !quantizedModules.isEmpty {
+            Flux2Debug.log("Installing \(quantizedModules.count) MXFP8 QuantizedLinear modules")
+            model.update(modules: ModuleChildren.unflattened(quantizedModules))
+        }
 
         // Use MLX's built-in weight loading - flatten to get full paths
         let flattenedArray = model.parameters().flattened()

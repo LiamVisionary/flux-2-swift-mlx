@@ -673,6 +673,24 @@ public class Flux2Pipeline: @unchecked Sendable {
         )
     }
 
+    /// Precompute text embeddings for server/warm paths that run multiple jobs.
+    /// The returned MLXArray can be passed to `generate(... precomputedEmbeddings:)`
+    /// to skip text-encoder load/encode/unload on repeated prompts.
+    public func precomputeTextEmbeddings(prompt: String, upsamplePrompt: Bool = false) async throws -> MLXArray {
+        try await loadTextEncoder()
+        let embeddings: MLXArray
+        switch model {
+        case .dev:
+            let (e, _) = try textEncoder!.encodeWithPrompt(prompt, upsample: upsamplePrompt)
+            embeddings = e
+        case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV:
+            let (e, _) = try kleinEncoder!.encodeWithPrompt(prompt, upsample: upsamplePrompt)
+            embeddings = e
+        }
+        eval(embeddings)
+        return embeddings
+    }
+
     /// Generate image with reference images from raw image data (PNG/JPEG)
     /// - Note: Uses CGImageSource for pixel-exact decoding, avoiding NSImage roundtrip
     ///         which can introduce subpixel shifts via AppKit re-rendering.
