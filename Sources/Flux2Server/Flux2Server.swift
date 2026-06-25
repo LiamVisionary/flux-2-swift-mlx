@@ -143,7 +143,7 @@ actor Flux2Service {
         // Default to qint8: this is Flux2Core's balanced fast path and avoids the
         // previous bf16 transformer bottleneck. ComfyUI still controls steps.
         let transformerQuant = TransformerQuantization(rawValue: env["FLUX2_TRANSFORMER_QUANT"] ?? "qint8") ?? .qint8
-        let modelName = (env["FLUX2_MODEL"] ?? "klein9B").lowercased()
+        let modelName = (env["FLUX2_MODEL"] ?? "klein9BKV").lowercased()
         let model: Flux2Model = {
             switch modelName {
             case "klein9bkv", "klein-9b-kv", "kv": return .klein9BKV
