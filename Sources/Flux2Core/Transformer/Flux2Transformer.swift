@@ -53,6 +53,11 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
     let normOut: AdaLayerNormContinuous
     @ModuleInfo var projOut: Linear             // Output projection: 6144 -> 128
 
+    private var cachedContextShape: [Int]?
+    private var cachedContextProjection: MLXArray?
+    private var cachedRopeKey: String?
+    private var cachedRopeEmb: (cos: MLXArray, sin: MLXArray)?
+
     /// Initialize Flux.2 Transformer
     /// - Parameters:
     ///   - config: Model configuration
@@ -111,6 +116,33 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         self.projOut = Linear(dim, config.outChannels, bias: false)
     }
 
+    public func resetInferenceCaches() {
+        cachedContextShape = nil
+        cachedContextProjection = nil
+        cachedRopeKey = nil
+        cachedRopeEmb = nil
+    }
+
+    private func projectedContext(_ encoderHiddenStates: MLXArray) -> MLXArray {
+        let shape = encoderHiddenStates.shape
+        if cachedContextShape == shape, let cached = cachedContextProjection { return cached }
+        let projected = contextEmbedder(encoderHiddenStates)
+        cachedContextShape = shape
+        cachedContextProjection = projected
+        return projected
+    }
+
+    private func ropeEmbedding(txtIds: MLXArray, imgIds: MLXArray) -> (cos: MLXArray, sin: MLXArray) {
+        let key = "txt:\(txtIds.shape)-img:\(imgIds.shape)"
+        if cachedRopeKey == key, let cached = cachedRopeEmb { return cached }
+        let combinedIds = concatenated([txtIds, imgIds], axis: 0)
+        let rope = posEmbed(combinedIds)
+        cachedRopeKey = key
+        cachedRopeEmb = rope
+        return rope
+    }
+
+
     /// Forward pass
     /// - Parameters:
     ///   - hiddenStates: Packed latent image [B, S_img, 128]
@@ -135,7 +167,7 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
 
         // Project inputs
         var imgHS = xEmbedder(hiddenStates)
-        var txtHS = contextEmbedder(encoderHiddenStates)
+        var txtHS = projectedContext(encoderHiddenStates)
         Flux2Debug.verbose("After projection - imgHS: \(imgHS.shape), txtHS: \(txtHS.shape)")
 
         // Scale timestep and guidance by 1000 (diffusers pattern)
@@ -150,8 +182,7 @@ public class Flux2Transformer2DModel: Module, @unchecked Sendable {
         Flux2Debug.verbose("temb shape: \(temb.shape)")
 
         // Generate RoPE embeddings
-        let combinedIds = concatenated([txtIds, imgIds], axis: 0)
-        let ropeEmb = posEmbed(combinedIds)
+        let ropeEmb = ropeEmbedding(txtIds: txtIds, imgIds: imgIds)
         Flux2Debug.verbose("RoPE shapes - cos: \(ropeEmb.cos.shape), sin: \(ropeEmb.sin.shape)")
 
         // --- Double-Stream Blocks ---

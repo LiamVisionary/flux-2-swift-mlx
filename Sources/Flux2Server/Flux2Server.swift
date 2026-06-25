@@ -18,6 +18,45 @@ struct GenerateRequest: Codable {
     var steps: Int?
     var guidance: Float?
     var seed: UInt64?
+    var jobId: String?
+}
+
+struct ProgressRecord: Codable {
+    var jobId: String
+    var currentStep: Int
+    var totalSteps: Int
+    var overallPercent: Int
+    var currentStepPercent: Int
+    var phase: String
+}
+
+final class ProgressStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [String: ProgressRecord] = [:]
+
+    func update(jobId: String, currentStep: Int, totalSteps: Int, phase: String = "denoise") {
+        lock.lock(); defer { lock.unlock() }
+        let total = max(1, totalSteps)
+        let current = max(0, min(currentStep, total))
+        records[jobId] = ProgressRecord(
+            jobId: jobId,
+            currentStep: current,
+            totalSteps: total,
+            overallPercent: Int((Double(current) / Double(total) * 100.0).rounded()),
+            currentStepPercent: current == 0 ? 0 : 100,
+            phase: phase
+        )
+    }
+
+    func get(jobId: String) -> ProgressRecord? {
+        lock.lock(); defer { lock.unlock() }
+        return records[jobId]
+    }
+
+    func clear(jobId: String) {
+        lock.lock(); defer { lock.unlock() }
+        records.removeValue(forKey: jobId)
+    }
 }
 
 struct GenerateResponse: Codable {
@@ -80,21 +119,79 @@ func saveImage(_ image: CGImage, to path: String) throws {
 
 actor Flux2Service {
     let pipeline: Flux2Pipeline
+    let progressStore: ProgressStore
     var embeddingCache: [String: MLXArray] = [:]
 
-    init() {
-        let textQuant = MistralQuantization.mlx8bit
-        let transformerQuant = TransformerQuantization.bf16
+    init(progressStore: ProgressStore) {
+        let env = ProcessInfo.processInfo.environment
+        let textQuant = MistralQuantization(rawValue: env["FLUX2_TEXT_QUANT"] ?? "8bit") ?? .mlx8bit
+        // Default to qint8: this is Flux2Core's balanced fast path and avoids the
+        // previous bf16 transformer bottleneck. ComfyUI still controls steps.
+        let transformerQuant = TransformerQuantization(rawValue: env["FLUX2_TRANSFORMER_QUANT"] ?? "qint8") ?? .qint8
+        let modelName = (env["FLUX2_MODEL"] ?? "klein9B").lowercased()
+        let model: Flux2Model = {
+            switch modelName {
+            case "klein9bkv", "klein-9b-kv", "kv": return .klein9BKV
+            case "klein9bbase", "klein-9b-base", "base": return .klein9BBase
+            case "klein4b", "klein-4b": return .klein4B
+            default: return .klein9B
+            }
+        }()
         let quant = Flux2QuantizationConfig(textEncoder: textQuant, transformer: transformerQuant)
-        let token = ProcessInfo.processInfo.environment["HF_TOKEN"]
-        self.pipeline = Flux2Pipeline(model: .klein9B, quantization: quant, vaeVariant: .standard, hfToken: token)
+        let token = env["HF_TOKEN"]
+        let memoryOptimization = Self.memoryOptimization(from: env)
+        let vaeVariant = ModelRegistry.VAEVariant(rawValue: env["FLUX2_VAE_VARIANT"] ?? "standard") ?? .standard
+        self.pipeline = Flux2Pipeline(
+            model: model,
+            quantization: quant,
+            memoryOptimization: memoryOptimization,
+            vaeVariant: vaeVariant,
+            hfToken: token
+        )
+        self.progressStore = progressStore
         self.pipeline.memoryProfile = .performance
+        self.pipeline.clearCacheEveryNSteps = Int(env["FLUX2_CLEAR_CACHE_EVERY_N_STEPS"] ?? "0") ?? 0
+        if Self.envFlag(env["FLUX2_PROFILE"]) {
+            Flux2Profiler.shared.enable()
+        } else {
+            Flux2Profiler.shared.disable()
+        }
         Flux2Debug.setNormalMode()
         FluxDebug.isEnabled = false
+        print("[Flux2Server] config model=\(model) textQuant=\(textQuant.rawValue) transformerQuant=\(transformerQuant.rawValue) memoryOptimization=\(memoryOptimization) vae=\(vaeVariant.rawValue) profile=\(Flux2Profiler.shared.isEnabled)")
+        fflush(stdout)
+    }
+
+    private static func envFlag(_ value: String?) -> Bool {
+        guard let value else { return false }
+        switch value.lowercased() {
+        case "1", "true", "yes", "on": return true
+        default: return false
+        }
+    }
+
+    private static func memoryOptimization(from env: [String: String]) -> MemoryOptimizationConfig {
+        switch (env["FLUX2_MEMORY_OPTIMIZATION"] ?? "disabled").lowercased() {
+        case "auto":
+            return MemoryOptimizationConfig.recommended(forRAMGB: Flux2MemoryManager.shared.physicalMemoryGB)
+        case "light":
+            return .light
+        case "moderate":
+            return .moderate
+        case "aggressive":
+            return .aggressive
+        case "ultralow", "ultra-low", "ultra_low":
+            return .ultraLowMemory
+        default:
+            return .disabled
+        }
     }
 
     func generate(_ req: GenerateRequest) async -> GenerateResponse {
         let t0 = Date()
+        if Flux2Profiler.shared.isEnabled {
+            Flux2Profiler.shared.reset()
+        }
         do {
             guard let loadedRef = loadImage(from: req.imagePath) else {
                 throw Flux2Error.imageProcessingFailed("Failed to load reference image: \(req.imagePath)")
@@ -111,6 +208,9 @@ actor Flux2Service {
                 embeddings = try await pipeline.precomputeTextEmbeddings(prompt: req.prompt, upsamplePrompt: false)
                 embeddingCache[req.prompt] = embeddings
             }
+            let jobId = req.jobId ?? UUID().uuidString
+            progressStore.update(jobId: jobId, currentStep: 0, totalSteps: req.steps ?? 1, phase: "starting")
+            pipeline.resetTransformerInferenceCaches()
             let image = try await pipeline.generate(
                 mode: .imageToImage(images: [ref]),
                 prompt: req.prompt,
@@ -123,14 +223,28 @@ actor Flux2Service {
                 upsamplePrompt: false,
                 precomputedEmbeddings: embeddings,
                 checkpointInterval: nil,
-                onProgress: nil,
+                onProgress: { [progressStore] current, total in
+                    progressStore.update(jobId: jobId, currentStep: current, totalSteps: total)
+                },
                 onCheckpoint: nil,
                 onStep: nil
             )
             try saveImage(image, to: req.outputPath)
-            return GenerateResponse(ok: true, outputPath: req.outputPath, elapsedSeconds: Date().timeIntervalSince(t0), error: nil)
+            let elapsed = Date().timeIntervalSince(t0)
+            print("[Flux2Server] job=\(jobId) width=\(targetWidth) height=\(targetHeight) steps=\(req.steps ?? 1) elapsed=\(String(format: "%.2f", elapsed))")
+            if Flux2Profiler.shared.isEnabled {
+                let report = Flux2Profiler.shared.generateReport()
+                if !report.isEmpty {
+                    print(report)
+                }
+            }
+            fflush(stdout)
+            return GenerateResponse(ok: true, outputPath: req.outputPath, elapsedSeconds: elapsed, error: nil)
         } catch {
-            return GenerateResponse(ok: false, outputPath: nil, elapsedSeconds: Date().timeIntervalSince(t0), error: String(describing: error))
+            let message = String(describing: error)
+            print("[Flux2Server] generate error: \(message)")
+            fflush(stdout)
+            return GenerateResponse(ok: false, outputPath: nil, elapsedSeconds: Date().timeIntervalSince(t0), error: message)
         }
     }
 }
@@ -138,10 +252,12 @@ actor Flux2Service {
 final class HTTPServer: @unchecked Sendable {
     let listener: NWListener
     let service: Flux2Service
+    let progressStore: ProgressStore
     let encoder = JSONEncoder()
 
-    init(port: UInt16, service: Flux2Service) throws {
+    init(port: UInt16, service: Flux2Service, progressStore: ProgressStore) throws {
         self.service = service
+        self.progressStore = progressStore
         self.listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
     }
 
@@ -180,6 +296,14 @@ final class HTTPServer: @unchecked Sendable {
         if method == "GET" && path == "/health" {
             respond(conn, status: "200 OK", body: Data("{\"ok\":true}".utf8), contentType: "application/json"); return
         }
+        if method == "GET" && path.hasPrefix("/progress/") {
+            let rawJobId = String(path.dropFirst("/progress/".count))
+            let jobId = rawJobId.removingPercentEncoding ?? rawJobId
+            if let progress = progressStore.get(jobId: jobId), let body = try? encoder.encode(progress) {
+                respond(conn, status: "200 OK", body: body, contentType: "application/json"); return
+            }
+            respond(conn, status: "404 Not Found", body: Data("{}".utf8), contentType: "application/json"); return
+        }
         guard method == "POST", path == "/generate" else {
             respond(conn, status: "404 Not Found", body: Data("not found".utf8), contentType: "text/plain"); return
         }
@@ -206,8 +330,9 @@ final class HTTPServer: @unchecked Sendable {
 }
 
 let port = UInt16(ProcessInfo.processInfo.environment["FLUX2_SERVER_PORT"] ?? "8791") ?? 8791
-let service = Flux2Service()
-let server = try HTTPServer(port: port, service: service)
+let progressStore = ProgressStore()
+let service = Flux2Service(progressStore: progressStore)
+let server = try HTTPServer(port: port, service: service, progressStore: progressStore)
 print("Flux2Server listening on 127.0.0.1:\(port)")
 fflush(stdout)
 server.start()

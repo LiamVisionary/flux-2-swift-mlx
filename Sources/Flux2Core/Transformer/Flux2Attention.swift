@@ -215,6 +215,11 @@ public class Flux2Attention: Module, @unchecked Sendable {
         cos: MLXArray,
         sin: MLXArray
     ) -> (MLXArray, MLXArray) {
+        if let qFused = Flux2FusedKernels.applyRotaryEmb(q, cos: cos, sin: sin),
+           let kFused = Flux2FusedKernels.applyRotaryEmb(k, cos: cos, sin: sin) {
+            return (qFused, kFused)
+        }
+
         // cos/sin: [S, D] -> [1, 1, S, D]
         let cosExpanded = cos.expandedDimensions(axes: [0, 1])
         let sinExpanded = sin.expandedDimensions(axes: [0, 1])

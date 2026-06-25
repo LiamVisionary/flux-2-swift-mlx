@@ -579,8 +579,13 @@ public class Flux2WeightLoader {
             )
         }
         if !quantizedModules.isEmpty {
+            print("[Flux2WeightLoader] Installing \(quantizedModules.count) MXFP8 QuantizedLinear modules")
+            fflush(stdout)
             Flux2Debug.log("Installing \(quantizedModules.count) MXFP8 QuantizedLinear modules")
             model.update(modules: ModuleChildren.unflattened(quantizedModules))
+        } else {
+            print("[Flux2WeightLoader] No MXFP8 QuantizedLinear modules detected in transformer weights")
+            fflush(stdout)
         }
 
         // Use MLX's built-in weight loading - flatten to get full paths

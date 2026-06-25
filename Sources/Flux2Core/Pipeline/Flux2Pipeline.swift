@@ -189,6 +189,10 @@ public class Flux2Pipeline: @unchecked Sendable {
         self.kleinEncoderPath = kleinEncoderPath
     }
 
+    public func resetTransformerInferenceCaches() {
+        transformer?.resetInferenceCaches()
+    }
+
     // MARK: - Model Loading
 
     // MARK: - Internal accessors for chain helpers
@@ -358,23 +362,38 @@ public class Flux2Pipeline: @unchecked Sendable {
         memoryManager.logMemoryState()
         Flux2Debug.log("Loading transformer for \(model.displayName)...")
 
-        // Get the appropriate transformer variant based on model type and quantization
-        let variant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
-
-        // Find model path
-        guard let modelPath = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) else {
-            let downloadCmd: String
-            switch model {
-            case .dev:
-                downloadCmd = "flux2 download --transformer \(quantization.transformer.rawValue)"
-            case .klein4B, .klein4BBase:
-                downloadCmd = "flux2 download --model klein-4b"
-            case .klein9B, .klein9BBase:
-                downloadCmd = "flux2 download --model klein-9b"
-            case .klein9BKV:
-                downloadCmd = "flux2 download --model klein-9b-kv"
+        // Allow the persistent server/wrapper to pin an explicit local transformer checkpoint
+        // (e.g. BigLoveKlein3_mxfp8_swift_mapped_mlx.safetensors). Without this override,
+        // Klein 9B resolves to the official cached BFL checkpoint, which both changes quality
+        // and misses the native MXFP8 model the user selected in ComfyUI.
+        let envTransformerPath = ProcessInfo.processInfo.environment["FLUX2_TRANSFORMER_PATH"]
+        let modelURL: URL
+        if let envTransformerPath, !envTransformerPath.isEmpty {
+            guard FileManager.default.fileExists(atPath: envTransformerPath) else {
+                throw Flux2Error.modelNotLoaded("FLUX2_TRANSFORMER_PATH does not exist: \(envTransformerPath)")
             }
-            throw Flux2Error.modelNotLoaded("\(model.displayName) transformer weights not found. Run: \(downloadCmd)")
+            modelURL = URL(fileURLWithPath: envTransformerPath)
+            Flux2Debug.log("Using explicit transformer path from FLUX2_TRANSFORMER_PATH: \(modelURL.path)")
+        } else {
+            // Get the appropriate transformer variant based on model type and quantization
+            let variant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+
+            // Find model path
+            guard let discoveredPath = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) else {
+                let downloadCmd: String
+                switch model {
+                case .dev:
+                    downloadCmd = "flux2 download --transformer \(quantization.transformer.rawValue)"
+                case .klein4B, .klein4BBase:
+                    downloadCmd = "flux2 download --model klein-4b"
+                case .klein9B, .klein9BBase:
+                    downloadCmd = "flux2 download --model klein-9b"
+                case .klein9BKV:
+                    downloadCmd = "flux2 download --model klein-9b-kv"
+                }
+                throw Flux2Error.modelNotLoaded("\(model.displayName) transformer weights not found. Run: \(downloadCmd)")
+            }
+            modelURL = discoveredPath
         }
 
         // Create model with appropriate config and memory optimization
@@ -387,7 +406,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         // Load weights with explicit memory management
         // For large models (Dev), this can temporarily use 2x memory during mapping
         Flux2Debug.log("Loading transformer weights from disk...")
-        var weights = try Flux2WeightLoader.loadWeights(from: modelPath)
+        var weights = try Flux2WeightLoader.loadWeights(from: modelURL)
 
         Flux2Debug.log("Applying weights to model...")
         try Flux2WeightLoader.applyTransformerWeights(&weights, to: transformer!)
@@ -1462,7 +1481,7 @@ public class Flux2Pipeline: @unchecked Sendable {
                     }
                 }
 
-                if stepIdx % 10 == 0 {
+                if (stepIdx + 1) % 10 == 0 {
                     memoryManager.clearCache()
                 }
             }
@@ -1671,7 +1690,7 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
 
             // Periodic memory cleanup
-            if stepIdx % 10 == 0 {
+            if (stepIdx + 1) % 10 == 0 {
                 memoryManager.clearCache()
             }
         }
@@ -2135,4 +2154,3 @@ extension Flux2Pipeline {
         return missing
     }
 }
-
