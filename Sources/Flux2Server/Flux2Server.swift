@@ -9,6 +9,11 @@ import CoreGraphics
 
 extension MLXArray: @unchecked Sendable {}
 
+struct LoRARequest: Codable, Hashable {
+    var filePath: String
+    var scale: Float?
+}
+
 struct GenerateRequest: Codable {
     var prompt: String
     var imagePath: String
@@ -19,6 +24,7 @@ struct GenerateRequest: Codable {
     var guidance: Float?
     var seed: UInt64?
     var jobId: String?
+    var loras: [LoRARequest]?
 }
 
 struct ProgressRecord: Codable {
@@ -118,8 +124,17 @@ func saveImage(_ image: CGImage, to path: String) throws {
 }
 
 actor Flux2Service {
-    let pipeline: Flux2Pipeline
+    let basePipeline: Flux2Pipeline
     let progressStore: ProgressStore
+    let model: Flux2Model
+    let quantization: Flux2QuantizationConfig
+    let memoryOptimization: MemoryOptimizationConfig?
+    let vaeVariant: ModelRegistry.VAEVariant
+    let hfToken: String?
+    let clearCacheEveryNSteps: Int
+    let loraPipelineCacheLimit: Int
+    var loraPipelines: [String: Flux2Pipeline] = [:]
+    var loraPipelineOrder: [String] = []
     var embeddingCache: [String: MLXArray] = [:]
 
     init(progressStore: ProgressStore) {
@@ -141,16 +156,23 @@ actor Flux2Service {
         let token = env["HF_TOKEN"]
         let memoryOptimization = Self.memoryOptimization(from: env)
         let vaeVariant = ModelRegistry.VAEVariant(rawValue: env["FLUX2_VAE_VARIANT"] ?? "standard") ?? .standard
-        self.pipeline = Flux2Pipeline(
+        let clearCacheEveryNSteps = Int(env["FLUX2_CLEAR_CACHE_EVERY_N_STEPS"] ?? "0") ?? 0
+        self.model = model
+        self.quantization = quant
+        self.memoryOptimization = memoryOptimization
+        self.vaeVariant = vaeVariant
+        self.hfToken = token
+        self.clearCacheEveryNSteps = clearCacheEveryNSteps
+        self.loraPipelineCacheLimit = max(1, Int(env["FLUX2_LORA_PIPELINE_CACHE_LIMIT"] ?? "1") ?? 1)
+        self.basePipeline = Self.makePipeline(
             model: model,
             quantization: quant,
             memoryOptimization: memoryOptimization,
             vaeVariant: vaeVariant,
-            hfToken: token
+            hfToken: token,
+            clearCacheEveryNSteps: clearCacheEveryNSteps
         )
         self.progressStore = progressStore
-        self.pipeline.memoryProfile = .performance
-        self.pipeline.clearCacheEveryNSteps = Int(env["FLUX2_CLEAR_CACHE_EVERY_N_STEPS"] ?? "0") ?? 0
         if Self.envFlag(env["FLUX2_PROFILE"]) {
             Flux2Profiler.shared.enable()
         } else {
@@ -158,8 +180,28 @@ actor Flux2Service {
         }
         Flux2Debug.setNormalMode()
         FluxDebug.isEnabled = false
-        print("[Flux2Server] config model=\(model) textQuant=\(textQuant.rawValue) transformerQuant=\(transformerQuant.rawValue) memoryOptimization=\(memoryOptimization) vae=\(vaeVariant.rawValue) profile=\(Flux2Profiler.shared.isEnabled)")
+        print("[Flux2Server] config model=\(model) textQuant=\(textQuant.rawValue) transformerQuant=\(transformerQuant.rawValue) memoryOptimization=\(memoryOptimization) vae=\(vaeVariant.rawValue) profile=\(Flux2Profiler.shared.isEnabled) loraCacheLimit=\(self.loraPipelineCacheLimit)")
         fflush(stdout)
+    }
+
+    private static func makePipeline(
+        model: Flux2Model,
+        quantization: Flux2QuantizationConfig,
+        memoryOptimization: MemoryOptimizationConfig?,
+        vaeVariant: ModelRegistry.VAEVariant,
+        hfToken: String?,
+        clearCacheEveryNSteps: Int
+    ) -> Flux2Pipeline {
+        let pipeline = Flux2Pipeline(
+            model: model,
+            quantization: quantization,
+            memoryOptimization: memoryOptimization,
+            vaeVariant: vaeVariant,
+            hfToken: hfToken
+        )
+        pipeline.memoryProfile = .performance
+        pipeline.clearCacheEveryNSteps = clearCacheEveryNSteps
+        return pipeline
     }
 
     private static func envFlag(_ value: String?) -> Bool {
@@ -187,6 +229,69 @@ actor Flux2Service {
         }
     }
 
+    private func normalizedLoRAs(_ loras: [LoRARequest]?) throws -> [LoRARequest] {
+        let fileManager = FileManager.default
+        return try (loras ?? [])
+            .filter { !$0.filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map { lora in
+                let url = URL(fileURLWithPath: lora.filePath).standardizedFileURL
+                guard fileManager.fileExists(atPath: url.path) else {
+                    throw Flux2Error.invalidConfiguration("LoRA file does not exist: \(lora.filePath)")
+                }
+                return LoRARequest(filePath: url.path, scale: lora.scale ?? 1.0)
+            }
+            .sorted {
+                if $0.filePath == $1.filePath {
+                    return ($0.scale ?? 1.0) < ($1.scale ?? 1.0)
+                }
+                return $0.filePath < $1.filePath
+            }
+    }
+
+    private func loraSignature(_ loras: [LoRARequest]) -> String {
+        loras
+            .map { "\($0.filePath)@\($0.scale ?? 1.0)" }
+            .joined(separator: "|")
+    }
+
+    private func touchLoRAPipeline(signature: String) {
+        loraPipelineOrder.removeAll { $0 == signature }
+        loraPipelineOrder.append(signature)
+    }
+
+    private func pipeline(for loras: [LoRARequest]?) throws -> (pipeline: Flux2Pipeline, loraCount: Int, cacheHit: Bool) {
+        let normalized = try normalizedLoRAs(loras)
+        guard !normalized.isEmpty else {
+            return (basePipeline, 0, true)
+        }
+
+        let signature = loraSignature(normalized)
+        if let cached = loraPipelines[signature] {
+            touchLoRAPipeline(signature: signature)
+            return (cached, normalized.count, true)
+        }
+
+        let pipeline = Self.makePipeline(
+            model: model,
+            quantization: quantization,
+            memoryOptimization: memoryOptimization,
+            vaeVariant: vaeVariant,
+            hfToken: hfToken,
+            clearCacheEveryNSteps: clearCacheEveryNSteps
+        )
+        for lora in normalized {
+            _ = try pipeline.loadLoRA(LoRAConfig(filePath: lora.filePath, scale: lora.scale ?? 1.0))
+        }
+        loraPipelines[signature] = pipeline
+        touchLoRAPipeline(signature: signature)
+        while loraPipelines.count > loraPipelineCacheLimit, let evict = loraPipelineOrder.first {
+            loraPipelineOrder.removeFirst()
+            loraPipelines.removeValue(forKey: evict)
+            MLX.Memory.clearCache()
+        }
+        return (pipeline, normalized.count, false)
+    }
+
     func generate(_ req: GenerateRequest) async -> GenerateResponse {
         let t0 = Date()
         if Flux2Profiler.shared.isEnabled {
@@ -201,17 +306,18 @@ actor Flux2Service {
             guard let ref = cropResizeImage(loadedRef, width: targetWidth, height: targetHeight) else {
                 throw Flux2Error.imageProcessingFailed("Failed to prepare reference image")
             }
+            let active = try pipeline(for: req.loras)
             let embeddings: MLXArray
             if let cached = embeddingCache[req.prompt] {
                 embeddings = cached
             } else {
-                embeddings = try await pipeline.precomputeTextEmbeddings(prompt: req.prompt, upsamplePrompt: false)
+                embeddings = try await basePipeline.precomputeTextEmbeddings(prompt: req.prompt, upsamplePrompt: false)
                 embeddingCache[req.prompt] = embeddings
             }
             let jobId = req.jobId ?? UUID().uuidString
             progressStore.update(jobId: jobId, currentStep: 0, totalSteps: req.steps ?? 1, phase: "starting")
-            pipeline.resetTransformerInferenceCaches()
-            let image = try await pipeline.generate(
+            active.pipeline.resetTransformerInferenceCaches()
+            let image = try await active.pipeline.generate(
                 mode: .imageToImage(images: [ref]),
                 prompt: req.prompt,
                 interpretImagePaths: nil,
@@ -231,7 +337,7 @@ actor Flux2Service {
             )
             try saveImage(image, to: req.outputPath)
             let elapsed = Date().timeIntervalSince(t0)
-            print("[Flux2Server] job=\(jobId) width=\(targetWidth) height=\(targetHeight) steps=\(req.steps ?? 1) elapsed=\(String(format: "%.2f", elapsed))")
+            print("[Flux2Server] job=\(jobId) width=\(targetWidth) height=\(targetHeight) steps=\(req.steps ?? 1) loras=\(active.loraCount) loraCacheHit=\(active.cacheHit) elapsed=\(String(format: "%.2f", elapsed))")
             if Flux2Profiler.shared.isEnabled {
                 let report = Flux2Profiler.shared.generateReport()
                 if !report.isEmpty {
