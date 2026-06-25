@@ -812,7 +812,7 @@ public class Flux2WeightLoader {
                     // 1. Dequantize MLX qint8 → float16
                     var mergedWeight = dequantized(
                         ql.weight, scales: ql.scales, biases: ql.biases,
-                        groupSize: ql.groupSize, bits: ql.bits
+                        groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
                     ).asType(.float16)
 
                     // 2. Apply all LoRA pairs
@@ -829,7 +829,7 @@ public class Flux2WeightLoader {
 
                     // 3. Requantize → MLX qint8
                     let (newWeight, newScales, newBiases) = quantized(
-                        mergedWeight, groupSize: ql.groupSize, bits: ql.bits
+                        mergedWeight, groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
                     )
 
                     // 4. Update weight, scales, and biases
