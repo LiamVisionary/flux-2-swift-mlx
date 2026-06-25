@@ -17,6 +17,7 @@ struct LoRARequest: Codable, Hashable {
 struct GenerateRequest: Codable {
     var prompt: String
     var imagePath: String
+    var imagePaths: [String]?
     var outputPath: String
     var width: Int?
     var height: Int?
@@ -143,7 +144,7 @@ actor Flux2Service {
         // Default to qint8: this is Flux2Core's balanced fast path and avoids the
         // previous bf16 transformer bottleneck. ComfyUI still controls steps.
         let transformerQuant = TransformerQuantization(rawValue: env["FLUX2_TRANSFORMER_QUANT"] ?? "qint8") ?? .qint8
-        let modelName = (env["FLUX2_MODEL"] ?? "klein9BKV").lowercased()
+        let modelName = (env["FLUX2_MODEL"] ?? "klein9B").lowercased()
         let model: Flux2Model = {
             switch modelName {
             case "klein9bkv", "klein-9b-kv", "kv": return .klein9BKV
@@ -298,13 +299,25 @@ actor Flux2Service {
             Flux2Profiler.shared.reset()
         }
         do {
-            guard let loadedRef = loadImage(from: req.imagePath) else {
-                throw Flux2Error.imageProcessingFailed("Failed to load reference image: \(req.imagePath)")
+            let sourcePaths = (req.imagePaths?.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).flatMap { $0.isEmpty ? nil : $0 } ?? [req.imagePath]
+            var loadedRefs: [(path: String, image: CGImage)] = []
+            for path in sourcePaths.prefix(3) {
+                guard let image = loadImage(from: path) else {
+                    throw Flux2Error.imageProcessingFailed("Failed to load reference image: \(path)")
+                }
+                loadedRefs.append((path, image))
             }
-            let targetWidth = req.width ?? loadedRef.width
-            let targetHeight = req.height ?? loadedRef.height
-            guard let ref = cropResizeImage(loadedRef, width: targetWidth, height: targetHeight) else {
-                throw Flux2Error.imageProcessingFailed("Failed to prepare reference image")
+            guard let firstRef = loadedRefs.first?.image else {
+                throw Flux2Error.imageProcessingFailed("No reference images provided")
+            }
+            let targetWidth = req.width ?? firstRef.width
+            let targetHeight = req.height ?? firstRef.height
+            var refs: [CGImage] = []
+            for item in loadedRefs {
+                guard let ref = cropResizeImage(item.image, width: targetWidth, height: targetHeight) else {
+                    throw Flux2Error.imageProcessingFailed("Failed to prepare reference image: \(item.path)")
+                }
+                refs.append(ref)
             }
             let active = try pipeline(for: req.loras)
             let embeddings: MLXArray
@@ -318,7 +331,7 @@ actor Flux2Service {
             progressStore.update(jobId: jobId, currentStep: 0, totalSteps: req.steps ?? 1, phase: "starting")
             active.pipeline.resetTransformerInferenceCaches()
             let image = try await active.pipeline.generate(
-                mode: .imageToImage(images: [ref]),
+                mode: .imageToImage(images: refs),
                 prompt: req.prompt,
                 interpretImagePaths: nil,
                 height: targetHeight,
@@ -337,7 +350,7 @@ actor Flux2Service {
             )
             try saveImage(image, to: req.outputPath)
             let elapsed = Date().timeIntervalSince(t0)
-            print("[Flux2Server] job=\(jobId) width=\(targetWidth) height=\(targetHeight) steps=\(req.steps ?? 1) loras=\(active.loraCount) loraCacheHit=\(active.cacheHit) elapsed=\(String(format: "%.2f", elapsed))")
+            print("[Flux2Server] job=\(jobId) width=\(targetWidth) height=\(targetHeight) steps=\(req.steps ?? 1) refs=\(refs.count) loras=\(active.loraCount) loraCacheHit=\(active.cacheHit) elapsed=\(String(format: "%.2f", elapsed))")
             if Flux2Profiler.shared.isEnabled {
                 let report = Flux2Profiler.shared.generateReport()
                 if !report.isEmpty {
